@@ -870,7 +870,7 @@ fn stream_remote_files(
 
         for remote_file in remote_files {
             let download = backend
-                .download_file_db(&remote_file, true)
+                .download_file_db(&remote_file, true, None)
                 .await
                 .map_err(|e| io::Error::other(e.to_string()))?;
             let reader: Box<dyn AsyncRead + Unpin + Send> = match download {

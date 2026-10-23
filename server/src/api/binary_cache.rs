@@ -6,27 +6,30 @@
 
 use std::collections::VecDeque;
 use std::io::Error as IoError;
+use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::http;
+use anyhow::anyhow;
 use axum::{
     Router,
     body::Body,
     extract::{Extension, Path},
-    http::StatusCode,
+    http::{HeaderMap, Method, StatusCode, header},
     response::{IntoResponse, Redirect, Response},
     routing::get,
 };
 use futures::TryStreamExt as _;
 use futures::stream::BoxStream;
+use http_range::{HttpRange, HttpRangeParseError};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use tokio_util::io::ReaderStream;
 use tracing::instrument;
 
 use crate::database::AtticDatabase;
 use crate::database::entity::chunk::ChunkModel;
-use crate::error::{ErrorKind, ServerResult};
+use crate::error::{ErrorKind, ServerError, ServerResult};
 use crate::narinfo::NarInfo;
 use crate::nix_manifest;
 use crate::storage::{Download, StorageBackend, StorageBackendImpl};
@@ -35,6 +38,53 @@ use attic::cache::CacheName;
 use attic::io::merge_chunks;
 use attic::mime;
 use attic::nix_store::StorePathHash;
+
+#[cfg(test)]
+mod tests;
+
+/// Returns the size of the compressed representation, checking chunk completeness.
+fn nar_file_size(chunks: &[Option<ChunkModel>]) -> ServerResult<u64> {
+    chunks.iter().try_fold(0_u64, |size, chunk| {
+        let chunk = chunk.as_ref().ok_or(ErrorKind::IncompleteNar)?;
+        let chunk_size = chunk
+            .file_size
+            .and_then(|size| u64::try_from(size).ok())
+            .ok_or_else(|| ErrorKind::DatabaseError(anyhow!("Invalid chunk file size")))?;
+        size.checked_add(chunk_size)
+            .ok_or_else(|| ErrorKind::DatabaseError(anyhow!("NAR file size overflow")).into())
+    })
+}
+
+/// Compares an If-None-Match list using weak comparison. Commas inside an
+/// opaque tag are part of that tag, not list separators.
+fn if_none_match(mut value: &str, etag: &str) -> bool {
+    value = value.trim();
+    if value == "*" {
+        return true;
+    }
+    let etag = etag.strip_prefix("W/").unwrap_or(etag);
+    let etag = etag
+        .strip_prefix('"')
+        .and_then(|etag| etag.strip_suffix('"'));
+    while !value.is_empty() {
+        value = value.trim_start_matches([',', ' ', '\t']);
+        value = value.strip_prefix("W/").unwrap_or(value);
+        let Some((tag, rest)) = value
+            .strip_prefix('"')
+            .and_then(|value| value.split_once('"'))
+        else {
+            return false;
+        };
+        value = rest.trim_start_matches([' ', '\t']);
+        if !value.is_empty() && !value.starts_with(',') {
+            return false;
+        }
+        if Some(tag) == etag {
+            return true;
+        }
+    }
+    false
+}
 
 /// Nix cache information.
 ///
@@ -136,10 +186,10 @@ async fn get_store_path_info(
         cache_name
     );
 
-    let (object, cache, nar, _) = state
+    let (object, cache, nar, chunks) = state
         .database()
         .await?
-        .find_object_and_chunks_by_store_path_hash(&cache_name, &store_path_hash, false)
+        .find_object_and_chunks_by_store_path_hash(&cache_name, &store_path_hash, true)
         .await?;
 
     let permission = req_state
@@ -149,7 +199,10 @@ async fn get_store_path_info(
 
     req_state.set_public_cache(cache.is_public);
 
-    let mut narinfo = object.to_nar_info(&nar)?;
+    let file_size = nar_file_size(&chunks)?
+        .try_into()
+        .map_err(ServerError::database_error)?;
+    let mut narinfo = object.to_nar_info(&nar, file_size)?;
 
     if narinfo.signature().is_none() {
         let keypair = cache.keypair()?;
@@ -171,6 +224,8 @@ async fn get_nar(
     Extension(state): Extension<State>,
     Extension(req_state): Extension<RequestState>,
     Path((cache_name, path)): Path<(CacheName, String)>,
+    method: Method,
+    headers: HeaderMap,
 ) -> ServerResult<Response> {
     let components: Vec<&str> = path.splitn(2, '.').collect();
 
@@ -203,10 +258,92 @@ async fn get_nar(
 
     req_state.set_public_cache(cache.is_public);
 
-    // TODO: Fully kill chunk recovery
-    if chunks.iter().any(Option::is_none) {
-        // at least one of the chunks is missing :(
-        return Err(ErrorKind::IncompleteNar.into());
+    let file_size = nar_file_size(&chunks)?;
+    let mut hasher = Sha256::new();
+    for chunk in chunks.iter().flatten() {
+        let file_hash = chunk
+            .file_hash
+            .as_ref()
+            .ok_or_else(|| ErrorKind::DatabaseError(anyhow!("Missing chunk file hash")))?;
+        hasher.update(file_hash.as_bytes());
+        hasher.update([0]);
+    }
+    // Bind the validator to compressed bytes, since recompression can change them
+    // without changing the uncompressed NAR hash.
+    let mut etag = format!("\"{}\"", hex::encode(hasher.finalize()));
+    if chunks.len() == 1
+        && let Some(storage_etag) = state
+            .storage()
+            .await?
+            .file_etag(&chunks[0].as_ref().unwrap().remote_file.0)
+            .await?
+    {
+        // A redirected GET exposes the storage service's validator, so HEAD
+        // and conditional requests must use that same validator.
+        etag = storage_etag;
+    }
+
+    let mut response = Response::builder()
+        .header(header::CONTENT_TYPE, mime::NAR)
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::ETAG, &etag);
+
+    // Preconditions are evaluated before Range and before opening any body.
+    if headers.get_all(header::IF_NONE_MATCH).iter().any(|value| {
+        value
+            .to_str()
+            .is_ok_and(|value| if_none_match(value, &etag))
+    }) {
+        if method == Method::GET {
+            database.bump_object_last_accessed(object.id).await?;
+        }
+        return Ok(response
+            .status(StatusCode::NOT_MODIFIED)
+            .header(header::CONTENT_LENGTH, file_size)
+            .body(Body::empty())
+            .unwrap());
+    }
+
+    // Range applies only to GET. Ignore multipart ranges and invalid syntax;
+    // a client can always fall back to downloading the full representation.
+    let range = if method == Method::GET
+        && headers.get_all(header::RANGE).iter().count() == 1
+        && headers
+            .get(header::IF_RANGE)
+            .is_none_or(|value| value == etag.as_str())
+        && let Some(value) = headers
+            .get(header::RANGE)
+            .and_then(|value| value.to_str().ok())
+        && !value.contains(',')
+    {
+        match HttpRange::parse(value, file_size) {
+            Ok(ranges) if file_size > 0 => ranges
+                .first()
+                .map(|range| range.start..range.start + range.length),
+            Ok(_) | Err(HttpRangeParseError::NoOverlap) => {
+                return Ok(response
+                    .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                    .header(header::CONTENT_RANGE, format!("bytes */{file_size}"))
+                    .body(Body::empty())
+                    .unwrap());
+            }
+            Err(HttpRangeParseError::InvalidRange) => None,
+        }
+    } else {
+        None
+    };
+
+    let selected = range.clone().unwrap_or(0..file_size);
+    response = response.header(header::CONTENT_LENGTH, selected.end - selected.start);
+    if range.is_some() {
+        response = response.status(StatusCode::PARTIAL_CONTENT).header(
+            header::CONTENT_RANGE,
+            format!("bytes {}-{}/{file_size}", selected.start, selected.end - 1,),
+        );
+    }
+
+    if method == Method::HEAD {
+        return Ok(response.body(Body::empty()).unwrap());
     }
 
     database.bump_object_last_accessed(object.id).await?;
@@ -216,7 +353,13 @@ async fn get_nar(
         let chunk = chunks[0].as_ref().unwrap();
         let remote_file = &chunk.remote_file.0;
         let storage = state.storage().await?;
-        match storage.download_file_db(remote_file, false).await? {
+        // Redirects retain the client's headers, so stream the full object when
+        // Range was ignored instead of letting S3 apply it again.
+        let prefer_stream = headers.contains_key(header::RANGE) && range.is_none();
+        match storage
+            .download_file_db(remote_file, prefer_stream, range)
+            .await?
+        {
             Download::Url(url) => Ok(Redirect::temporary(&url).into_response()),
             Download::AsyncRead(stream) => {
                 let stream = ReaderStream::new(stream).map_err(|e| {
@@ -225,14 +368,7 @@ async fn get_nar(
                 });
                 let body = Body::from_stream(stream);
 
-                Ok((
-                    [(
-                        http::header::CONTENT_TYPE,
-                        http::HeaderValue::from_static(mime::NAR),
-                    )],
-                    body,
-                )
-                    .into_response())
+                Ok(response.body(body).unwrap())
             }
         }
     } else {
@@ -241,9 +377,10 @@ async fn get_nar(
             IoError::other(e)
         }
 
-        let streamer = |chunk: ChunkModel, storage: Arc<StorageBackendImpl>| async move {
+        let streamer = |(chunk, range): (ChunkModel, Option<Range<u64>>),
+                        storage: Arc<StorageBackendImpl>| async move {
             match storage
-                .download_file_db(&chunk.remote_file.0, true)
+                .download_file_db(&chunk.remote_file.0, true, range)
                 .await
                 .map_err(io_error)?
             {
@@ -255,25 +392,30 @@ async fn get_nar(
             }
         };
 
-        let chunks: VecDeque<_> = chunks.into_iter().map(Option::unwrap).collect();
+        let mut selected_chunks = VecDeque::new();
+        let mut offset = 0;
+        for chunk in chunks.into_iter().map(Option::unwrap) {
+            let start = offset;
+            offset += chunk.file_size.unwrap() as u64;
+            if offset <= selected.start || start >= selected.end {
+                continue;
+            }
+            let chunk_range = range
+                .as_ref()
+                .map(|_| selected.start.saturating_sub(start)..selected.end.min(offset) - start);
+            selected_chunks.push_back((chunk, chunk_range));
+        }
         let storage = state.storage().await?.clone();
 
         // TODO: Make num_prefetch configurable
         // The ideal size depends on the average chunk size
-        let merged = merge_chunks(chunks, streamer, storage, 2).map_err(|e| {
+        let merged = merge_chunks(selected_chunks, streamer, storage, 2).map_err(|e| {
             tracing::error!(%e, "Stream error");
             e
         });
         let body = Body::from_stream(merged);
 
-        Ok((
-            [(
-                http::header::CONTENT_TYPE,
-                http::HeaderValue::from_static(mime::NAR),
-            )],
-            body,
-        )
-            .into_response())
+        Ok(response.body(body).unwrap())
     }
 }
 

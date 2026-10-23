@@ -1,5 +1,6 @@
 //! S3 remote files.
 
+use std::ops::Range;
 use std::time::Duration;
 
 use aws_config::{BehaviorVersion, retry::RetryConfig};
@@ -335,14 +336,33 @@ impl StorageBackend for S3Backend {
         Ok(())
     }
 
+    async fn file_etag(&self, file: &RemoteFile) -> ServerResult<Option<String>> {
+        let (client, file) = self.get_client_from_db_ref(file).await?;
+        let output = client
+            .head_object()
+            .bucket(&file.bucket)
+            .key(&file.key)
+            .send()
+            .await
+            .map_err(ServerError::storage_error)?;
+        let etag = output
+            .e_tag
+            .ok_or_else(|| ErrorKind::StorageError(anyhow::anyhow!("S3 object has no ETag")))?;
+        Ok(Some(etag))
+    }
+
     async fn download_file_db(
         &self,
         file: &RemoteFile,
         prefer_stream: bool,
+        range: Option<Range<u64>>,
     ) -> ServerResult<Download> {
         let (client, file) = self.get_client_from_db_ref(file).await?;
 
-        let req = client.get_object().bucket(&file.bucket).key(&file.key);
+        let mut req = client.get_object().bucket(&file.bucket).key(&file.key);
+        if prefer_stream && let Some(range) = range {
+            req = req.range(format!("bytes={}-{}", range.start, range.end - 1));
+        }
 
         self.get_download(req, prefer_stream).await
     }

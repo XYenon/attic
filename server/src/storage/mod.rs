@@ -3,6 +3,8 @@
 mod local;
 mod s3;
 
+use std::ops::Range;
+
 use enum_dispatch::enum_dispatch;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncRead;
@@ -65,11 +67,18 @@ pub(crate) trait StorageBackend: Send + Sync + std::fmt::Debug {
     /// Deletes a file using a database reference.
     async fn delete_file_db(&self, file: &RemoteFile) -> ServerResult<()>;
 
+    /// Returns the validator exposed by direct downloads, if the backend uses one.
+    async fn file_etag(&self, file: &RemoteFile) -> ServerResult<Option<String>>;
+
     /// Downloads a file using a database reference.
+    ///
+    /// For streams, `range` selects a half-open byte range in the stored file.
+    /// For URLs, the client sends its Range header directly to the storage service.
     async fn download_file_db(
         &self,
         file: &RemoteFile,
         prefer_stream: bool,
+        range: Option<Range<u64>>,
     ) -> ServerResult<Download>;
 
     /// Creates a database reference for a file.

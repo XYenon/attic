@@ -116,7 +116,7 @@ impl InsertExt for Insert<ActiveModel> {
 
 impl Model {
     /// Converts this object to a NarInfo.
-    pub fn to_nar_info(&self, nar: &NarModel) -> ServerResult<NarInfo> {
+    pub fn to_nar_info(&self, nar: &NarModel, file_size: usize) -> ServerResult<NarInfo> {
         let nar_size = nar
             .nar_size
             .try_into()
@@ -128,7 +128,7 @@ impl Model {
 
             compression: Compression::from_str(&nar.compression)?,
             file_hash: None, // FIXME
-            file_size: None, // FIXME
+            file_size: Some(file_size),
             nar_hash: Hash::from_typed(&nar.nar_hash)?,
             nar_size,
             system: self.system.to_owned(),

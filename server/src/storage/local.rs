@@ -1,13 +1,14 @@
 //! Local file storage.
 
 use std::ffi::OsStr;
+use std::ops::Range;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use tokio::fs::{self, File};
-use tokio::io::{self, AsyncRead};
+use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncSeekExt};
 use tokio::sync::Mutex;
 
 use super::{Download, RemoteFile, StorageBackend};
@@ -224,10 +225,15 @@ impl StorageBackend for LocalBackend {
         Ok(())
     }
 
+    async fn file_etag(&self, _file: &RemoteFile) -> ServerResult<Option<String>> {
+        Ok(None)
+    }
+
     async fn download_file_db(
         &self,
         file: &RemoteFile,
         _prefer_stream: bool,
+        range: Option<Range<u64>>,
     ) -> ServerResult<Download> {
         let file = if let RemoteFile::Local(file) = file {
             file
@@ -238,11 +244,20 @@ impl StorageBackend for LocalBackend {
             .into());
         };
 
-        let file = File::open(self.get_path(&file.name))
+        let mut file = File::open(self.get_path(&file.name))
             .await
             .map_err(ServerError::storage_error)?;
 
-        Ok(Download::AsyncRead(Box::new(file)))
+        if let Some(range) = range {
+            file.seek(io::SeekFrom::Start(range.start))
+                .await
+                .map_err(ServerError::storage_error)?;
+            Ok(Download::AsyncRead(Box::new(
+                file.take(range.end - range.start),
+            )))
+        } else {
+            Ok(Download::AsyncRead(Box::new(file)))
+        }
     }
 
     async fn make_db_reference(&self, name: String) -> ServerResult<RemoteFile> {
