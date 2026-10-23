@@ -100,3 +100,6 @@ features = [
   "signal",
   "sync",
 ]
+
+[dev-dependencies]
+tempfile = "3"

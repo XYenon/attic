@@ -58,6 +58,9 @@ pub enum ErrorKind {
     /// The requested NAR has missing chunks and needs to be repaired.
     IncompleteNar,
 
+    /// Part upload is already in progress. Retry this request later.
+    UploadPartInProgress,
+
     /// Database error: {0:#}
     DatabaseError(AnyError),
 
@@ -188,6 +191,7 @@ impl ErrorKind {
             Self::CacheAlreadyExists => "CacheAlreadyExists",
             Self::InvalidCompressionType { .. } => "InvalidCompressionType",
             Self::IncompleteNar => "IncompleteNar",
+            Self::UploadPartInProgress => "UploadPartInProgress",
             Self::AtticError(e) => e.name(),
             Self::DatabaseError(_) => "DatabaseError",
             Self::StorageError(_) => "StorageError",
@@ -233,6 +237,7 @@ impl ErrorKind {
             Self::NoSuchObject => StatusCode::NOT_FOUND,
             Self::CacheAlreadyExists => StatusCode::BAD_REQUEST,
             Self::IncompleteNar => StatusCode::SERVICE_UNAVAILABLE,
+            Self::UploadPartInProgress => StatusCode::SERVICE_UNAVAILABLE,
             Self::ManifestSerializationError(_) => StatusCode::BAD_REQUEST,
             Self::RequestError(_) => StatusCode::BAD_REQUEST,
             Self::InvalidCompressionType { .. } => StatusCode::BAD_REQUEST,

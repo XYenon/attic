@@ -2,6 +2,8 @@ use std::error::Error as StdError;
 use std::fmt;
 use std::io;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use anyhow::Result;
 use bytes::Bytes;
@@ -238,8 +240,8 @@ impl ApiClient {
         }
     }
 
-    /// Uploads a chunked transport upload session part, reporting body bytes as
-    /// they are sent to the HTTP client.
+    /// Uploads a chunked transport upload session part, retrying transient errors.
+    /// Reports each logical body byte at most once, even when it is retransmitted.
     pub async fn upload_session_part_with_progress<F>(
         &self,
         session_id: uuid::Uuid,
@@ -257,31 +259,59 @@ impl ApiClient {
 
         let body_len = bytes.len();
         let on_progress = Arc::new(on_progress);
-        let body_stream = stream::unfold((bytes, 0), move |(bytes, offset)| {
+        let reported = Arc::new(AtomicUsize::new(0));
+        let mut delay = Duration::from_secs(1);
+        let mut attempt = 1;
+        loop {
             let on_progress = on_progress.clone();
-            async move {
-                if offset >= body_len {
-                    return None;
+            let reported = reported.clone();
+            let bytes = bytes.clone();
+            let body_stream = stream::iter((0..body_len).step_by(UPLOAD_PROGRESS_CHUNK_SIZE)).map(
+                move |offset| {
+                    let end = (offset + UPLOAD_PROGRESS_CHUNK_SIZE).min(body_len);
+                    let previous = reported.fetch_max(end, Ordering::Relaxed);
+                    if end > previous {
+                        on_progress((end - previous) as u64);
+                    }
+                    Ok::<_, io::Error>(bytes.slice(offset..end))
+                },
+            );
+
+            let result: Result<()> = async {
+                let res = self
+                    .client
+                    .put(endpoint.clone())
+                    .timeout(Duration::from_secs(120))
+                    .header(reqwest::header::CONTENT_LENGTH, body_len)
+                    .body(Body::wrap_stream(body_stream))
+                    .send()
+                    .await?;
+                if res.status().is_success() {
+                    Ok(())
+                } else {
+                    Err(ApiError::try_from_response(res).await?.into())
                 }
-
-                let end = (offset + UPLOAD_PROGRESS_CHUNK_SIZE).min(body_len);
-                let chunk = bytes.slice(offset..end);
-                on_progress(chunk.len() as u64);
-                Some((Ok::<_, io::Error>(chunk), (bytes, end)))
             }
-        });
+            .await;
 
-        let res = self
-            .client
-            .put(endpoint)
-            .body(Body::wrap_stream(body_stream))
-            .send()
-            .await?;
-        if res.status().is_success() {
-            Ok(())
-        } else {
-            let api_error = ApiError::try_from_response(res).await?;
-            Err(api_error.into())
+            match result {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    let retryable = error
+                        .downcast_ref::<ApiError>()
+                        .is_some_and(ApiError::is_retryable)
+                        || error.downcast_ref::<reqwest::Error>().is_some_and(|e| {
+                            e.is_timeout() || e.is_connect() || e.is_request() || e.is_body()
+                        });
+                    if !retryable || attempt == 5 {
+                        return Err(error);
+                    }
+                    tracing::warn!(%session_id, seq, attempt, %error, "Retrying upload part");
+                    tokio::time::sleep(delay).await;
+                    delay *= 2;
+                    attempt += 1;
+                }
+            }
         }
     }
 
@@ -340,7 +370,11 @@ impl ApiError {
 
     async fn try_from_response(response: Response) -> Result<Self> {
         let status = response.status();
-        let text = response.text().await?;
+        // A truncated error body must not hide the status used for retries.
+        let text = match response.text().await {
+            Ok(text) => text,
+            Err(error) => return Ok(Self::Unstructured(status, error.to_string())),
+        };
         match serde_json::from_str(&text) {
             Ok(s) => Ok(Self::Structured(s)),
             Err(_) => Ok(Self::Unstructured(status, text)),
@@ -368,4 +402,131 @@ fn build_http_client(token: Option<&str>) -> HttpClient {
         .default_headers(headers)
         .build()
         .unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    // None means the body was received but the connection lost its response.
+    async fn upload_part_with_responses(
+        responses: &[Option<u16>],
+        truncate_error_body: bool,
+    ) -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let api = ApiClient {
+            endpoint,
+            client: build_http_client(None),
+        };
+        let session_id = uuid::Uuid::new_v4();
+        let bytes = Bytes::from(
+            (0..UPLOAD_PROGRESS_CHUNK_SIZE * 2 + 17)
+                .map(|i| (i % 251) as u8)
+                .collect::<Vec<_>>(),
+        );
+        let expected = bytes.clone();
+        let responses = responses.to_vec();
+        let server = tokio::spawn(async move {
+            for response in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let header_end = loop {
+                    assert_ne!(socket.read_buf(&mut request).await.unwrap(), 0);
+                    if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break end + 4;
+                    }
+                };
+                let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+                assert!(headers.starts_with(&format!(
+                    "PUT /_api/v1/upload-path/sessions/{session_id}/parts/7 HTTP/1.1\r\n"
+                )));
+                assert!(
+                    headers
+                        .to_ascii_lowercase()
+                        .contains(&format!("content-length: {}\r\n", expected.len()))
+                );
+                while request.len() - header_end < expected.len() {
+                    assert_ne!(socket.read_buf(&mut request).await.unwrap(), 0);
+                }
+                assert_eq!(&request[header_end..], expected.as_ref());
+                if let Some(status) = response {
+                    let length = if truncate_error_body && status >= 400 {
+                        100
+                    } else {
+                        0
+                    };
+                    socket
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 {status} Test\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"
+                            )
+                            .as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        let reported = Arc::new(AtomicUsize::new(0));
+        let progress = reported.clone();
+        let result = tokio::time::timeout(
+            Duration::from_secs(25),
+            api.upload_session_part_with_progress(session_id, 7, bytes.clone(), move |len| {
+                let total = progress.fetch_add(len as usize, Ordering::Relaxed) + len as usize;
+                assert!(total <= UPLOAD_PROGRESS_CHUNK_SIZE * 2 + 17);
+            }),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reported.load(Ordering::Relaxed), bytes.len());
+        result
+    }
+
+    #[tokio::test]
+    async fn upload_part_replays_lost_response_and_transient_errors_without_double_progress() {
+        upload_part_with_responses(&[None, Some(408), Some(429), Some(500), Some(200)], false)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn upload_part_retries_truncated_transient_error_responses() {
+        upload_part_with_responses(&[Some(408), Some(429), Some(503), Some(200)], true)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn upload_part_stops_after_five_transient_failures() {
+        let error = upload_part_with_responses(&[Some(503); 5], false)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<ApiError>().unwrap().status_code(),
+            Some(StatusCode::SERVICE_UNAVAILABLE)
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_part_does_not_retry_permanent_errors() {
+        for truncate_error_body in [false, true] {
+            for status in [400, 401, 403, 404, 409] {
+                let error = upload_part_with_responses(&[Some(status)], truncate_error_body)
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    error.downcast_ref::<ApiError>().unwrap().status_code(),
+                    StatusCode::from_u16(status).ok()
+                );
+            }
+        }
+    }
 }

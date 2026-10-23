@@ -58,6 +58,9 @@ use crate::database::entity::upload_session_part::{
 use crate::database::{AtticDatabase, ChunkGuard, NarGuard};
 use crate::storage::{Download, RemoteFile};
 
+#[cfg(test)]
+mod tests;
+
 /// Number of chunks to upload to the storage backend at once.
 ///
 /// TODO: Make this configurable
@@ -374,15 +377,35 @@ pub(crate) async fn upload_session_part(
                 .map_err(ServerError::database_error)?
             {
                 if existing.state == UploadSessionPartState::Pending.as_str() {
+                    return Err(ErrorKind::UploadPartInProgress.into());
+                }
+
+                // A successful upload may have lost its response. Compare both
+                // the hash and length without overwriting the committed object.
+                let remote_file = serde_json::from_str(&existing.remote_file)
+                    .map_err(ServerError::database_error)?;
+                let saved = stream_remote_files(state.clone(), vec![remote_file]);
+                futures::pin_mut!(saved);
+                let (mut saved, saved_hash) =
+                    HashReader::new(StreamReader::new(saved), Sha256::new());
+                let incoming = body
+                    .into_data_stream()
+                    .map(|r| r.map_err(|e| io::Error::other(e.to_string())));
+                let (mut incoming, incoming_hash) =
+                    HashReader::new(StreamReader::new(incoming), Sha256::new());
+                tokio::io::copy(&mut incoming, &mut tokio::io::sink())
+                    .await
+                    .map_err(ServerError::request_error)?;
+                tokio::io::copy(&mut saved, &mut tokio::io::sink())
+                    .await
+                    .map_err(ServerError::storage_error)?;
+                if incoming_hash.get().unwrap() != saved_hash.get().unwrap() {
                     return Err(ErrorKind::RequestError(anyhow!(
-                        "Part upload is already in progress"
+                        "Part sequence has already been uploaded with different content"
                     ))
                     .into());
                 }
-
-                return Err(
-                    ErrorKind::RequestError(anyhow!("Part has already been uploaded")).into(),
-                );
+                return Ok(());
             }
 
             return Err(ServerError::database_error(e));
@@ -561,18 +584,18 @@ fn spawn_finalize_upload_session(
 ) {
     spawn(async move {
         let session_id = session.id.clone();
-        let finalize =
-            finalize_upload_session_inner(state.clone(), req_state, session, upload_info);
-        tokio::pin!(finalize);
-        let mut heartbeat = time::interval(UPLOAD_SESSION_FINALIZE_HEARTBEAT);
-
-        let result = loop {
-            tokio::select! {
-                result = &mut finalize => break result,
-                _ = heartbeat.tick() => {
-                    heartbeat_upload_session_finalization(&state, &session_id).await;
-                }
+        let heartbeat = async {
+            let mut interval = time::interval(UPLOAD_SESSION_FINALIZE_HEARTBEAT);
+            loop {
+                interval.tick().await;
+                heartbeat_upload_session_finalization(&state, &session_id).await;
             }
+        };
+
+        // Keep polling finalization while a heartbeat waits for a database connection.
+        let result = tokio::select! {
+            result = finalize_upload_session_inner(state.clone(), req_state, session, upload_info) => result,
+            _ = heartbeat => unreachable!(),
         };
 
         if let Err(e) = result {
